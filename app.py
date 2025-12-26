@@ -34,51 +34,14 @@ st.set_page_config(page_title="Mike Agent v3 - Unified Dashboard", layout="wide"
 # ============================================================================
 
 def get_live_data_for_prediction(symbol: str, bars: int = 100) -> pd.DataFrame:
-    """Fetch REAL-TIME live data - uses yfinance for real-time market data"""
+    """Fetch REAL-TIME live data - Prioritizes Alpaca (real-time with paper trading), then Massive, then yfinance"""
     est = pytz.timezone('US/Eastern')
     now = datetime.datetime.now(est)
     current_time = now.strftime('%H:%M:%S EST')
+    today = now.date()
+    today_str = today.strftime('%Y-%m-%d')
     
-    # Use yfinance - download with explicit date range for today
-    try:
-        # Get today's date for the download
-        today = now.date()
-        start_date = today.strftime('%Y-%m-%d')
-        
-        # Try downloading with today's date explicitly
-        ticker = yf.Ticker(symbol)
-        
-        # Get intraday data for today - using history method which is more reliable
-        data = ticker.history(period="1d", interval="1m")
-        
-        if len(data) > 0:
-            # Columns are already lowercase for history()
-            data.columns = [c.lower() for c in data.columns]
-            
-            # Make sure timezone is EST
-            if data.index.tzinfo is None:
-                data.index = data.index.tz_localize('America/New_York')
-            elif str(data.index.tzinfo) != 'America/New_York':
-                data.index = data.index.tz_convert('America/New_York')
-            
-            # Get latest bar info
-            latest_bar_time = data.index[-1]
-            latest_price = data['close'].iloc[-1]
-            bar_time_str = latest_bar_time.strftime('%H:%M EST')
-            bar_date = latest_bar_time.strftime('%Y-%m-%d')
-            
-            # Check if data is from today
-            if bar_date == str(today):
-                st.caption(f"📡 LIVE: {symbol} @ ${latest_price:.2f} | Latest: {bar_time_str} | Now: {current_time}")
-            else:
-                st.caption(f"⏳ {symbol} @ ${latest_price:.2f} | Last trade: {bar_date} {bar_time_str}")
-            
-            return data.tail(bars)
-            
-    except Exception as e:
-        st.warning(f"⚠️ yfinance error for {symbol}: {e}")
-    
-    # Fallback to Alpaca if yfinance fails
+    # ========== PRIORITY 1: ALPACA API (Real-Time with Paper Trading) ==========
     try:
         api = tradeapi.REST(
             config.ALPACA_KEY,
@@ -86,32 +49,121 @@ def get_live_data_for_prediction(symbol: str, bars: int = 100) -> pd.DataFrame:
             config.ALPACA_BASE_URL
         )
         
-        # Get bars for today specifically
-        today_str = now.strftime('%Y-%m-%d')
+        # Get ALL bars for today (up to 1000) to ensure we get the MOST RECENT data
+        # Alpaca returns oldest first, so we need enough to include current time
         bars_data = api.get_bars(
             symbol, 
             '1Min', 
             start=today_str,
-            limit=bars
+            limit=1000  # Get all today's bars
         ).df
         
         if len(bars_data) > 0:
             bars_data.columns = [c.lower() for c in bars_data.columns]
+            
+            # Convert timezone from UTC to EST
             if bars_data.index.tzinfo is not None:
                 bars_data.index = bars_data.index.tz_convert(est)
             else:
                 bars_data.index = bars_data.index.tz_localize('UTC').tz_convert(est)
             
+            # Get the LATEST data (tail of the dataframe)
             latest_bar = bars_data.index[-1]
             latest_price = bars_data['close'].iloc[-1]
             bar_time_str = latest_bar.strftime('%H:%M EST')
             
-            st.caption(f"📡 Alpaca: {symbol} @ ${latest_price:.2f} | Latest: {bar_time_str}")
-            return bars_data
+            # Check data freshness
+            delay_seconds = (now - latest_bar).total_seconds()
+            delay_minutes = delay_seconds / 60
+            
+            # Check if market is open (9:30 AM - 4:00 PM EST)
+            market_open = 9.5 <= now.hour + (now.minute / 60) < 16.0
+            
+            if market_open and delay_minutes < 5:
+                status = "📡 REAL-TIME (Alpaca)"
+            elif market_open and delay_minutes < 20:
+                status = f"📡 Alpaca ({delay_minutes:.0f}m)"
+            elif not market_open:
+                status = f"📡 Alpaca (Closed)"
+            else:
+                status = f"⏳ Alpaca ({delay_minutes:.0f}m old)"
+            
+            st.caption(f"{status}: {symbol} @ ${latest_price:.2f} | Latest: {bar_time_str} | Now: {current_time}")
+            return bars_data.tail(bars)  # Return the MOST RECENT bars
             
     except Exception as e:
-        st.error(f"❌ All data sources failed for {symbol}: {e}")
+        pass  # Fall through to next source
     
+    # ========== PRIORITY 2: MASSIVE/POLYGON API (May be 15-min delayed) ==========
+    try:
+        from massive_api_client import MassiveAPIClient
+        massive_client = MassiveAPIClient()
+        
+        # Get today's data from Massive API
+        end_date_str = (now + timedelta(days=1)).strftime('%Y-%m-%d')
+        data = massive_client.get_historical_data(symbol, today_str, end_date_str, interval='1m')
+        
+        if data is not None and len(data) > 0:
+            data.columns = [c.lower() for c in data.columns]
+            
+            # Massive API returns timestamps in UTC - convert to EST
+            if data.index.tzinfo is None:
+                data.index = data.index.tz_localize('UTC').tz_convert('US/Eastern')
+            else:
+                data.index = data.index.tz_convert('US/Eastern')
+            
+            # Filter to today's data only
+            data = data[data.index.date == today]
+            
+            if len(data) > 0:
+                latest_bar_time = data.index[-1]
+                latest_price = data['close'].iloc[-1]
+                bar_time_str = latest_bar_time.strftime('%H:%M EST')
+                
+                # Check data freshness
+                delay_seconds = (now - latest_bar_time).total_seconds()
+                delay_minutes = delay_seconds / 60
+                
+                if delay_minutes > 10:
+                    status = f"⏳ Massive API ({delay_minutes:.0f}m delayed)"
+                else:
+                    status = "📡 Massive API"
+                
+                st.caption(f"{status}: {symbol} @ ${latest_price:.2f} | Latest: {bar_time_str} | Now: {current_time}")
+                return data.tail(bars)
+    except Exception as e:
+        pass  # Fall through to yfinance
+    
+    # ========== PRIORITY 3: YFINANCE (Fallback) ==========
+    try:
+        ticker = yf.Ticker(symbol)
+        data = ticker.history(period="1d", interval="1m")
+        
+        if len(data) > 0:
+            data.columns = [c.lower() for c in data.columns]
+            
+            # Make sure timezone is EST
+            if data.index.tzinfo is None:
+                data.index = data.index.tz_localize('US/Eastern')
+            else:
+                data.index = data.index.tz_convert('US/Eastern')
+            
+            latest_bar_time = data.index[-1]
+            latest_price = data['close'].iloc[-1]
+            bar_time_str = latest_bar_time.strftime('%H:%M EST')
+            bar_date = latest_bar_time.strftime('%Y-%m-%d')
+            
+            if bar_date == today_str:
+                st.caption(f"📡 yfinance: {symbol} @ ${latest_price:.2f} | Latest: {bar_time_str} | Now: {current_time}")
+            else:
+                st.caption(f"⏳ yfinance: {symbol} @ ${latest_price:.2f} | Last: {bar_date} {bar_time_str}")
+            
+            return data.tail(bars)
+            
+    except Exception as e:
+        st.warning(f"⚠️ yfinance error for {symbol}: {e}")
+    
+    st.error(f"❌ All data sources failed for {symbol}")
     return pd.DataFrame()
 
 
@@ -130,7 +182,9 @@ def create_prediction_candlestick(df: pd.DataFrame, predictions: pd.DataFrame, s
         close=df_20['close'],
         name='Last 20 Candles',
         increasing_line_color='#00ff88',
-        decreasing_line_color='#ff4444'
+        decreasing_line_color='#ff4444',
+        increasing_fillcolor='#00ff88',
+        decreasing_fillcolor='#ff4444'
     ))
     
     # Predicted candles
@@ -143,9 +197,11 @@ def create_prediction_candlestick(df: pd.DataFrame, predictions: pd.DataFrame, s
             high=predictions['high'],
             low=predictions['low'],
             close=predictions['close'],
-            name='Predicted 5 Candles',
-            increasing_line_color='#7c3aed',
-            decreasing_line_color='#f472b6'
+            name='Predicted 20 Candles',
+            increasing_line_color='#00ff88',  # Same green as real candles
+            decreasing_line_color='#ff4444',  # Same red as real candles
+            increasing_fillcolor='#00ff88',   # Green fill for up candles
+            decreasing_fillcolor='#ff4444'    # Red fill for down candles
         ))
         
         fig.add_vline(x=len(df_20) - 0.5, line_dash="dash", line_color="cyan",
@@ -168,7 +224,7 @@ def create_prediction_candlestick(df: pd.DataFrame, predictions: pd.DataFrame, s
     x_labels = [f"T-{20-i}" for i in range(20)] + [f"T+{i+1}" for i in range(5)]
     
     fig.update_layout(
-        title=dict(text=f"🔮 {symbol}: Last 20 → Next 5 Candles", font=dict(size=16, color='white'), x=0.5),
+        title=dict(text=f"🔮 {symbol}: Last 20 → Next 20 Candles", font=dict(size=16, color='white'), x=0.5),
         template='plotly_dark',
         paper_bgcolor='rgba(0,0,0,0)',
         plot_bgcolor='rgba(0,0,0,0.3)',
@@ -186,6 +242,14 @@ def create_simple_candlestick(df: pd.DataFrame, title: str) -> go.Figure:
     """Create simple candlestick chart with actual timestamps"""
     df_plot = df.tail(50).copy()
     
+    # Ensure index is in EST timezone before plotting
+    # Data from Massive API is in UTC - convert to EST
+    if df_plot.index.tzinfo is None:
+        # Assume UTC if no timezone (Massive API returns UTC)
+        df_plot.index = df_plot.index.tz_localize('UTC').tz_convert('US/Eastern')
+    else:
+        df_plot.index = df_plot.index.tz_convert('US/Eastern')
+    
     # Use actual datetime index for x-axis
     fig = go.Figure()
     fig.add_trace(go.Candlestick(
@@ -195,17 +259,39 @@ def create_simple_candlestick(df: pd.DataFrame, title: str) -> go.Figure:
         low=df_plot['low'],
         close=df_plot['close'],
         increasing_line_color='#00ff88',
-        decreasing_line_color='#ff4444'
+        decreasing_line_color='#ff4444',
+        increasing_fillcolor='#00ff88',
+        decreasing_fillcolor='#ff4444'
     ))
     
     # Get current time and latest data time
     est = pytz.timezone('US/Eastern')
     current_time = datetime.datetime.now(est).strftime('%H:%M:%S EST')
     
-    # Get latest bar time from actual data
-    if len(df_plot) > 0 and hasattr(df_plot.index[-1], 'strftime'):
-        latest_bar = df_plot.index[-1].strftime('%H:%M EST')
+    # Get latest bar time from actual data - ensure it's displayed in EST
+    if len(df_plot) > 0:
+        latest_bar_ts = df_plot.index[-1]
         latest_price = df_plot['close'].iloc[-1]
+        
+        # Ensure timestamp is converted to EST timezone before formatting
+        # Data should already be in EST from conversion above, but verify
+        if hasattr(latest_bar_ts, 'tz_localize'):
+            # pandas Timestamp
+            if latest_bar_ts.tzinfo is None:
+                # Assume UTC if naive, convert to EST
+                latest_bar_ts = latest_bar_ts.tz_localize('UTC').tz_convert('US/Eastern')
+            else:
+                latest_bar_ts = latest_bar_ts.tz_convert('US/Eastern')
+        elif hasattr(latest_bar_ts, 'astimezone'):
+            # datetime object
+            if latest_bar_ts.tzinfo is None:
+                # Assume UTC if naive
+                latest_bar_ts = pytz.UTC.localize(latest_bar_ts).astimezone(est)
+            else:
+                latest_bar_ts = latest_bar_ts.astimezone(est)
+        
+        # Format in EST (timestamp is now guaranteed to be in EST)
+        latest_bar = latest_bar_ts.strftime('%H:%M EST')
         subtitle = f"Latest bar: {latest_bar} | Price: ${latest_price:.2f}"
     else:
         subtitle = f"Update: {current_time}"
@@ -233,7 +319,7 @@ def create_simple_candlestick(df: pd.DataFrame, title: str) -> go.Figure:
 def render_prediction_tab():
     """Render the prediction tab content"""
     st.markdown("<h2 style='text-align: center;'>🔮 Price Predictions</h2>", unsafe_allow_html=True)
-    st.caption("Transformer-based model predicting next 5 candles from last 20")
+    st.caption("Transformer-based model predicting next 20 candles from last 20")
     
     # Initialize predictor and logger
     try:
@@ -269,12 +355,39 @@ def render_prediction_tab():
         st.error("❌ Could not fetch market data")
         return
     
-    # Make predictions
+    # Make predictions with validation
     try:
+        # Get the last 20 candles being used as input
+        spy_last_20 = spy_data.tail(20)
+        qqq_last_20 = qqq_data.tail(20)
+        
+        # Show what data is being used for prediction
+        spy_input_start = spy_last_20['close'].iloc[0]
+        spy_input_end = spy_last_20['close'].iloc[-1]
+        qqq_input_start = qqq_last_20['close'].iloc[0]
+        qqq_input_end = qqq_last_20['close'].iloc[-1]
+        
+        st.caption(f"🔍 **SPY Input:** Last 20 bars from ${spy_input_start:.2f} → ${spy_input_end:.2f} (Δ {((spy_input_end/spy_input_start)-1)*100:+.2f}%)")
+        st.caption(f"🔍 **QQQ Input:** Last 20 bars from ${qqq_input_start:.2f} → ${qqq_input_end:.2f} (Δ {((qqq_input_end/qqq_input_start)-1)*100:+.2f}%)")
+        
+        # Make predictions
         spy_predictions = predictor.predict(spy_data, "SPY")
         qqq_predictions = predictor.predict(qqq_data, "QQQ")
+        
+        # Validate predictions are reasonable (within 2% of current price)
+        spy_pred_close = spy_predictions['close'].iloc[-1]
+        qqq_pred_close = qqq_predictions['close'].iloc[-1]
+        
+        spy_diff = abs((spy_pred_close - spy_input_end) / spy_input_end * 100)
+        qqq_diff = abs((qqq_pred_close - qqq_input_end) / qqq_input_end * 100)
+        
+        if spy_diff > 5:
+            st.warning(f"⚠️ SPY prediction seems off: {spy_diff:.1f}% from current - model may need retraining")
+        if qqq_diff > 5:
+            st.warning(f"⚠️ QQQ prediction seems off: {qqq_diff:.1f}% from current - model may need retraining")
+            
     except Exception as e:
-        st.warning(f"⚠️ Model not trained. Using trend-based prediction. ({e})")
+        st.warning(f"⚠️ Model error: {e}. Using trend-based prediction.")
         spy_predictions = create_fallback_prediction(spy_data)
         qqq_predictions = create_fallback_prediction(qqq_data)
     
@@ -310,7 +423,9 @@ def render_prediction_tab():
     with col2:
         if spy_metrics:
             color = "🟢" if spy_metrics['direction'] == 'BULLISH' else "🔴" if spy_metrics['direction'] == 'BEARISH' else "🟡"
-            st.metric(f"SPY Prediction {color}", f"${spy_metrics['target']:.2f}", f"{spy_metrics['pct_change']:+.2f}%")
+            # Show predicted price at T+20 based on actual model output
+            pred_20_price = spy_predictions['close'].iloc[-1] if len(spy_predictions) > 0 else spy_metrics['target']
+            st.metric(f"SPY Prediction {color}", f"${pred_20_price:.2f}", f"{spy_metrics['pct_change']:+.2f}%")
     
     with col3:
         delta = ((qqq_data['close'].iloc[-1] / qqq_data['close'].iloc[-2]) - 1) * 100
@@ -319,7 +434,22 @@ def render_prediction_tab():
     with col4:
         if qqq_metrics:
             color = "🟢" if qqq_metrics['direction'] == 'BULLISH' else "🔴" if qqq_metrics['direction'] == 'BEARISH' else "🟡"
-            st.metric(f"QQQ Prediction {color}", f"${qqq_metrics['target']:.2f}", f"{qqq_metrics['pct_change']:+.2f}%")
+            pred_20_price = qqq_predictions['close'].iloc[-1] if len(qqq_predictions) > 0 else qqq_metrics['target']
+            st.metric(f"QQQ Prediction {color}", f"${pred_20_price:.2f}", f"{qqq_metrics['pct_change']:+.2f}%")
+    
+    # Show raw prediction data for verification
+    with st.expander("🔬 Raw Prediction Details (Click to verify)"):
+        st.write("**SPY Predicted Candles (T+1 to T+20):**")
+        spy_pred_df = spy_predictions[['open', 'high', 'low', 'close']].copy()
+        spy_pred_df.index = [f"T+{i+1}" for i in range(len(spy_pred_df))]
+        st.dataframe(spy_pred_df.style.format("${:.2f}"), use_container_width=True)
+        
+        st.write("**QQQ Predicted Candles (T+1 to T+20):**")
+        qqq_pred_df = qqq_predictions[['open', 'high', 'low', 'close']].copy()
+        qqq_pred_df.index = [f"T+{i+1}" for i in range(len(qqq_pred_df))]
+        st.dataframe(qqq_pred_df.style.format("${:.2f}"), use_container_width=True)
+        
+        st.caption("These predictions are generated by the Transformer model based on the last 20 candles of live data.")
     
     st.divider()
     
@@ -338,7 +468,7 @@ def render_prediction_tab():
     st.divider()
     
     # Charts Row 2: Predictions
-    st.subheader("🔮 Predictions: Last 20 → Next 5 Candles")
+    st.subheader("🔮 Predictions: Last 20 → Next 20 Candles")
     col1, col2 = st.columns(2)
     
     with col1:
@@ -864,11 +994,12 @@ def display_portfolio_bar(portfolio_data):
     if 'error' in portfolio_data:
         st.error(portfolio_data['error'])
         st.info("💡 **To fix:** Set these environment variables on Railway/local:\n- `APCA_API_KEY_ID`\n- `APCA_API_SECRET_KEY`\n- `APCA_API_BASE_URL` (optional, defaults to paper trading)")
-    
+        return
+
     # Portfolio bar in Alpaca style
     pnl_color = "#ef4444" if portfolio_data['daily_pnl_pct'] < 0 else "#10b981"
     realized_pnl = portfolio_data.get('realized_pnl', portfolio_data.get('today_pnl', 0))
-    
+
     portfolio_bar_html = f"""
     <div style="background:white; padding:20px; border-radius:8px; margin:15px 0; box-shadow:0 1px 3px rgba(0,0,0,0.1); display:flex; justify-content:space-between; align-items:center;">
         <div style="flex:1;">

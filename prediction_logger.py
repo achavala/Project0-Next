@@ -31,7 +31,7 @@ class PredictionRecord:
     # Last known price when prediction was made
     current_price: float
     
-    # Predicted candles (5 candles)
+    # Predicted candles (20 candles)
     predicted_open: List[float]
     predicted_high: List[float]
     predicted_low: List[float]
@@ -239,21 +239,26 @@ class PredictionLogger:
     def _log_to_file(self, record: PredictionRecord):
         """Append prediction to daily log file in human-readable format"""
         log_file = self.log_dir / f"prediction_log_{datetime.now().strftime('%Y%m%d')}.txt"
+        num_candles = len(record.predicted_close)
         
         with open(log_file, 'a') as f:
-            f.write(f"\n{'='*60}\n")
+            f.write(f"\n{'='*80}\n")
             f.write(f"PREDICTION: {record.id}\n")
-            f.write(f"{'='*60}\n")
+            f.write(f"{'='*80}\n")
             f.write(f"Time: {record.timestamp}\n")
             f.write(f"Symbol: {record.symbol}\n")
             f.write(f"Current Price: ${record.current_price:.2f}\n")
             f.write(f"Direction: {record.predicted_direction}\n")
             f.write(f"Expected Change: {record.predicted_change_pct:+.2f}%\n")
             f.write(f"Target Price: ${record.predicted_target:.2f}\n")
-            f.write(f"\nPredicted Candles (T+1 to T+5):\n")
-            for i in range(5):
-                f.write(f"  T+{i+1}: O=${record.predicted_open[i]:.2f} H=${record.predicted_high[i]:.2f} "
-                       f"L=${record.predicted_low[i]:.2f} C=${record.predicted_close[i]:.2f}\n")
+            f.write(f"\nPredicted {num_candles} Candles (T+1 to T+{num_candles}):\n")
+            f.write(f"{'─'*80}\n")
+            f.write(f"  {'Candle':<8} {'Open':>10} {'High':>10} {'Low':>10} {'Close':>10}\n")
+            f.write(f"{'─'*80}\n")
+            for i in range(num_candles):
+                f.write(f"  T+{i+1:<5} ${record.predicted_open[i]:>9.2f} ${record.predicted_high[i]:>9.2f} "
+                       f"${record.predicted_low[i]:>9.2f} ${record.predicted_close[i]:>9.2f}\n")
+            f.write(f"{'─'*80}\n")
             f.write(f"\n")
     
     def validate_prediction(
@@ -266,7 +271,7 @@ class PredictionLogger:
         
         Args:
             pred_id: Prediction ID
-            actual_data: DataFrame with actual OHLCV data (5 rows)
+            actual_data: DataFrame with actual OHLCV data (20 rows)
         
         Returns:
             Validation metrics
@@ -286,12 +291,15 @@ class PredictionLogger:
             logger.warning(f"Prediction {pred_id} not found")
             return {}
         
-        # Fill in actual data
-        record.actual_open = actual_data['open'].tolist()[:5]
-        record.actual_high = actual_data['high'].tolist()[:5]
-        record.actual_low = actual_data['low'].tolist()[:5]
-        record.actual_close = actual_data['close'].tolist()[:5]
-        record.actual_volume = actual_data['volume'].tolist()[:5]
+        # Get number of candles predicted
+        num_candles = len(record.predicted_close)
+        
+        # Fill in actual data (match the number of predicted candles)
+        record.actual_open = actual_data['open'].tolist()[:num_candles]
+        record.actual_high = actual_data['high'].tolist()[:num_candles]
+        record.actual_low = actual_data['low'].tolist()[:num_candles]
+        record.actual_close = actual_data['close'].tolist()[:num_candles]
+        record.actual_volume = actual_data['volume'].tolist()[:num_candles]
         
         # Calculate metrics
         pred_close = np.array(record.predicted_close)
@@ -384,14 +392,16 @@ class PredictionLogger:
     def _log_validation(self, record: PredictionRecord):
         """Log validation results to file"""
         log_file = self.log_dir / f"validation_log_{datetime.now().strftime('%Y%m%d')}.txt"
+        num_candles = len(record.predicted_close)
         
         with open(log_file, 'a') as f:
-            f.write(f"\n{'='*60}\n")
+            f.write(f"\n{'='*80}\n")
             f.write(f"VALIDATION: {record.id}\n")
-            f.write(f"{'='*60}\n")
+            f.write(f"{'='*80}\n")
             f.write(f"Validated At: {record.validated_at}\n")
             f.write(f"Symbol: {record.symbol}\n")
             f.write(f"Prediction Time: {record.timestamp}\n")
+            f.write(f"Number of Candles: {num_candles}\n")
             f.write(f"\nPREDICTED:\n")
             f.write(f"  Direction: {record.predicted_direction} ({record.predicted_change_pct:+.2f}%)\n")
             f.write(f"  Target: ${record.predicted_target:.2f}\n")
@@ -400,6 +410,15 @@ class PredictionLogger:
             actual_dir = "BULLISH" if actual_change > 0.05 else "BEARISH" if actual_change < -0.05 else "NEUTRAL"
             f.write(f"  Direction: {actual_dir} ({actual_change:+.2f}%)\n")
             f.write(f"  Final Price: ${record.actual_close[-1]:.2f}\n")
+            f.write(f"\nCANDLE COMPARISON (Predicted vs Actual Close):\n")
+            f.write(f"{'─'*60}\n")
+            for i in range(min(num_candles, len(record.actual_close))):
+                pred_c = record.predicted_close[i]
+                act_c = record.actual_close[i]
+                diff = act_c - pred_c
+                diff_pct = (diff / act_c) * 100 if act_c != 0 else 0
+                f.write(f"  T+{i+1:<3}: Pred=${pred_c:>8.2f} | Actual=${act_c:>8.2f} | Diff={diff:+.2f} ({diff_pct:+.2f}%)\n")
+            f.write(f"{'─'*60}\n")
             f.write(f"\nMETRICS:\n")
             f.write(f"  Direction Correct: {'✓ YES' if record.direction_correct else '✗ NO'}\n")
             f.write(f"  Price Accuracy: {record.price_accuracy_pct:.1f}%\n")
@@ -503,54 +522,154 @@ class PredictionLogger:
     
     def generate_eod_report(self, date: str = None) -> str:
         """
-        Generate end-of-day validation report
+        Generate end-of-day validation report as Markdown
         
         Args:
             date: Date in YYYY-MM-DD format (default: today)
         
         Returns:
-            Report as string
+            Report as markdown string
         """
         if date is None:
             date = datetime.now().strftime('%Y-%m-%d')
         
         summary = self.get_daily_summary(date)
         
-        report = []
-        report.append("=" * 70)
-        report.append(f"📊 PREDICTION VALIDATION REPORT - {date}")
-        report.append("=" * 70)
-        report.append("")
-        report.append(f"Total Predictions: {summary['total_predictions']}")
-        report.append(f"Validated: {summary['validated']}")
-        report.append(f"Pending Validation: {summary['pending_validation']}")
-        report.append("")
+        # Build Markdown report
+        md = []
+        md.append(f"# 📊 Prediction Validation Report")
+        md.append(f"## Date: {date}")
+        md.append(f"")
+        md.append(f"*Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S EST')}*")
+        md.append(f"")
+        md.append(f"---")
+        md.append(f"")
+        md.append(f"## 📋 Summary")
+        md.append(f"")
+        md.append(f"| Metric | Value |")
+        md.append(f"|--------|-------|")
+        md.append(f"| Total Predictions | {summary['total_predictions']} |")
+        md.append(f"| Validated | {summary['validated']} |")
+        md.append(f"| Pending Validation | {summary['pending_validation']} |")
+        md.append(f"")
         
         if summary['validated'] > 0:
-            report.append("📈 ACCURACY METRICS:")
-            report.append(f"  Direction Correct: {summary['direction_correct']}/{summary['validated']} ({summary['direction_accuracy_pct']:.1f}%)")
-            report.append(f"  Avg Price Accuracy: {summary['avg_price_accuracy_pct']:.1f}%")
-            report.append(f"  Avg Candle Direction Accuracy: {summary['avg_candle_direction_accuracy_pct']:.1f}%")
-            report.append(f"  Avg MAE: ${summary['avg_mae']:.4f}")
-            report.append("")
+            md.append(f"## 📈 Accuracy Metrics")
+            md.append(f"")
+            md.append(f"| Metric | Value |")
+            md.append(f"|--------|-------|")
+            md.append(f"| Direction Correct | {summary['direction_correct']}/{summary['validated']} ({summary['direction_accuracy_pct']:.1f}%) |")
+            md.append(f"| Avg Price Accuracy | {summary['avg_price_accuracy_pct']:.1f}% |")
+            md.append(f"| Avg Candle Direction Accuracy | {summary['avg_candle_direction_accuracy_pct']:.1f}% |")
+            md.append(f"| Avg MAE | ${summary['avg_mae']:.4f} |")
+            md.append(f"")
             
-            report.append("📊 BY SYMBOL:")
+            # Performance badge
+            accuracy = summary['direction_accuracy_pct']
+            if accuracy >= 70:
+                badge = "🟢 **EXCELLENT**"
+            elif accuracy >= 50:
+                badge = "🟡 **GOOD**"
+            else:
+                badge = "🔴 **NEEDS IMPROVEMENT**"
+            md.append(f"### Overall Performance: {badge}")
+            md.append(f"")
+            
+            md.append(f"## 📊 Performance by Symbol")
+            md.append(f"")
+            md.append(f"| Symbol | Total | Validated | Direction Correct | Accuracy |")
+            md.append(f"|--------|-------|-----------|-------------------|----------|")
             for sym, stats in summary['by_symbol'].items():
                 if stats['validated'] > 0:
                     acc = stats['direction_correct'] / stats['validated'] * 100
-                    report.append(f"  {sym}: {stats['direction_correct']}/{stats['validated']} correct ({acc:.1f}%)")
+                    emoji = "✅" if acc >= 50 else "❌"
+                    md.append(f"| {sym} | {stats['total']} | {stats['validated']} | {stats['direction_correct']} | {emoji} {acc:.1f}% |")
                 else:
-                    report.append(f"  {sym}: {stats['total']} predictions (not validated)")
+                    md.append(f"| {sym} | {stats['total']} | 0 | - | ⏳ Pending |")
+            md.append(f"")
+        else:
+            md.append(f"## ⏳ No Validated Predictions Yet")
+            md.append(f"")
+            md.append(f"Predictions are waiting to be validated against actual market data.")
+            md.append(f"")
         
-        report.append("")
-        report.append("=" * 70)
+        # Detailed predictions section
+        md.append(f"## 📝 Detailed Predictions")
+        md.append(f"")
         
-        report_text = "\n".join(report)
+        # Get all predictions for the day
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id, timestamp, symbol, current_price, predicted_direction, 
+                   predicted_change_pct, predicted_target, validated, direction_correct,
+                   price_accuracy_pct, predicted_close
+            FROM predictions 
+            WHERE DATE(timestamp) = ?
+            ORDER BY timestamp
+        ''', (date,))
+        rows = cursor.fetchall()
+        conn.close()
         
-        # Save to file
-        report_file = self.log_dir / f"eod_report_{date.replace('-', '')}.txt"
+        if rows:
+            md.append(f"| Time | Symbol | Direction | Pred Change | Target | Status | Result |")
+            md.append(f"|------|--------|-----------|-------------|--------|--------|--------|")
+            for row in rows:
+                time_str = row[1].split('T')[1][:8] if 'T' in row[1] else row[1]
+                status = "✅ Validated" if row[7] else "⏳ Pending"
+                if row[7]:  # validated
+                    result = "✅ Correct" if row[8] else "❌ Wrong"
+                    result += f" ({row[9]:.1f}%)" if row[9] else ""
+                else:
+                    result = "-"
+                direction_emoji = "📈" if row[4] == "BULLISH" else "📉" if row[4] == "BEARISH" else "➡️"
+                md.append(f"| {time_str} | {row[2]} | {direction_emoji} {row[4]} | {row[5]:+.2f}% | ${row[6]:.2f} | {status} | {result} |")
+        else:
+            md.append(f"*No predictions recorded for this date.*")
+        
+        md.append(f"")
+        md.append(f"---")
+        md.append(f"")
+        md.append(f"## 🔧 Model Information")
+        md.append(f"")
+        md.append(f"- **Model Type**: Transformer-based Price Predictor")
+        md.append(f"- **Input**: Last 20 candles (1-minute bars)")
+        md.append(f"- **Output**: Next 20 candles predicted")
+        md.append(f"- **Symbols**: SPY, QQQ")
+        md.append(f"")
+        md.append(f"---")
+        md.append(f"")
+        md.append(f"*This report is automatically generated by the Mike Agent Prediction System.*")
+        
+        report_text = "\n".join(md)
+        
+        # Save to Markdown file
+        report_file = self.log_dir / f"prediction_report_{date.replace('-', '')}.md"
         with open(report_file, 'w') as f:
             f.write(report_text)
+        
+        # Also save a plain text version for backward compatibility
+        txt_report_file = self.log_dir / f"eod_report_{date.replace('-', '')}.txt"
+        with open(txt_report_file, 'w') as f:
+            # Write plain text version
+            plain_report = []
+            plain_report.append("=" * 70)
+            plain_report.append(f"PREDICTION VALIDATION REPORT - {date}")
+            plain_report.append("=" * 70)
+            plain_report.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S EST')}")
+            plain_report.append("")
+            plain_report.append(f"Total Predictions: {summary['total_predictions']}")
+            plain_report.append(f"Validated: {summary['validated']}")
+            plain_report.append(f"Pending Validation: {summary['pending_validation']}")
+            if summary['validated'] > 0:
+                plain_report.append("")
+                plain_report.append("ACCURACY METRICS:")
+                plain_report.append(f"  Direction Correct: {summary['direction_correct']}/{summary['validated']} ({summary['direction_accuracy_pct']:.1f}%)")
+                plain_report.append(f"  Avg Price Accuracy: {summary['avg_price_accuracy_pct']:.1f}%")
+                plain_report.append(f"  Avg Candle Direction Accuracy: {summary['avg_candle_direction_accuracy_pct']:.1f}%")
+                plain_report.append(f"  Avg MAE: ${summary['avg_mae']:.4f}")
+            plain_report.append("=" * 70)
+            f.write("\n".join(plain_report))
         
         logger.info(f"📄 EOD report saved to {report_file}")
         
@@ -570,45 +689,49 @@ def get_prediction_logger() -> PredictionLogger:
 
 if __name__ == "__main__":
     # Test the logger
-    logger = get_prediction_logger()
+    pred_logger = get_prediction_logger()
     
-    # Create a sample prediction
+    # Create a sample prediction with 20 candles
     import pandas as pd
     
-    pred_df = pd.DataFrame({
-        'open': [100.0, 100.5, 101.0, 101.5, 102.0],
-        'high': [100.5, 101.0, 101.5, 102.0, 102.5],
-        'low': [99.5, 100.0, 100.5, 101.0, 101.5],
-        'close': [100.2, 100.8, 101.2, 101.8, 102.3],
-        'volume': [1000, 1100, 1200, 1300, 1400]
-    })
+    # Generate 20 candle predictions
+    base_price = 100.0
+    pred_data = {
+        'open': [base_price + i * 0.1 for i in range(20)],
+        'high': [base_price + i * 0.1 + 0.2 for i in range(20)],
+        'low': [base_price + i * 0.1 - 0.1 for i in range(20)],
+        'close': [base_price + i * 0.1 + 0.15 for i in range(20)],
+        'volume': [1000 + i * 50 for i in range(20)]
+    }
+    pred_df = pd.DataFrame(pred_data)
     
     # Log prediction
-    pred_id = logger.log_prediction(
+    pred_id = pred_logger.log_prediction(
         symbol="TEST",
-        current_price=100.0,
+        current_price=base_price,
         predictions=pred_df,
         predicted_direction="BULLISH",
-        predicted_change_pct=2.3,
-        predicted_target=102.3
+        predicted_change_pct=2.0,
+        predicted_target=base_price * 1.02
     )
     
     print(f"Logged prediction: {pred_id}")
     
-    # Simulate actual data
-    actual_df = pd.DataFrame({
-        'open': [100.1, 100.6, 101.1, 101.4, 101.9],
-        'high': [100.6, 101.1, 101.6, 101.9, 102.4],
-        'low': [99.6, 100.1, 100.6, 101.0, 101.4],
-        'close': [100.3, 100.9, 101.3, 101.6, 102.1],
-        'volume': [1050, 1150, 1250, 1350, 1450]
-    })
+    # Simulate actual data (20 candles)
+    actual_data = {
+        'open': [base_price + i * 0.08 for i in range(20)],
+        'high': [base_price + i * 0.08 + 0.18 for i in range(20)],
+        'low': [base_price + i * 0.08 - 0.08 for i in range(20)],
+        'close': [base_price + i * 0.08 + 0.12 for i in range(20)],
+        'volume': [1020 + i * 45 for i in range(20)]
+    }
+    actual_df = pd.DataFrame(actual_data)
     
     # Validate
-    metrics = logger.validate_prediction(pred_id, actual_df)
+    metrics = pred_logger.validate_prediction(pred_id, actual_df)
     print(f"Validation metrics: {metrics}")
     
     # Generate report
-    report = logger.generate_eod_report()
+    report = pred_logger.generate_eod_report()
     print(report)
 

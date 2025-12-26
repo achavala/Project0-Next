@@ -85,13 +85,13 @@ def validate_all_pending(pred_logger):
             # Get actual data
             actual_data = get_live_data(record.symbol, bars=50)
             
-            if actual_data is None or len(actual_data) < 5:
+            if actual_data is None or len(actual_data) < 20:
                 print(f"  ⚠️ Could not fetch actual data for {record.symbol}")
                 continue
             
-            # Find the 5 candles after the prediction time
-            # For simplicity, use the most recent 5 candles if prediction is old enough
-            actual_candles = actual_data.tail(5)
+            # Find the 20 candles after the prediction time
+            # For simplicity, use the most recent 20 candles if prediction is old enough
+            actual_candles = actual_data.tail(20)
             
             # Validate
             metrics = pred_logger.validate_prediction(record.id, actual_candles)

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Price Prediction Model using Transformer Architecture
-Predicts next 5 candles (OHLCV) based on last 20 candles
+Predicts next 20 candles (OHLCV) based on last 20 candles
 Auto-learns from prediction errors to improve over time
 """
 
@@ -47,7 +47,7 @@ class CandlePredictionTransformer(nn.Module):
     """
     Transformer model for predicting future OHLCV candles
     Input: Last 20 candles (each with 5 features: O, H, L, C, V)
-    Output: Next 5 candles (each with 5 features: O, H, L, C, V)
+    Output: Next 20 candles (each with 5 features: O, H, L, C, V)
     """
     def __init__(
         self,
@@ -59,7 +59,7 @@ class CandlePredictionTransformer(nn.Module):
         dim_feedforward: int = 512,
         dropout: float = 0.1,
         input_seq_len: int = 20,
-        output_seq_len: int = 5
+        output_seq_len: int = 20
     ):
         super().__init__()
         
@@ -186,7 +186,7 @@ class PricePredictor:
         self,
         model_dir: str = "models/predictor",
         input_seq_len: int = 20,
-        output_seq_len: int = 5
+        output_seq_len: int = 20
     ):
         self.model_dir = Path(model_dir)
         self.model_dir.mkdir(parents=True, exist_ok=True)
@@ -394,7 +394,7 @@ class PricePredictor:
     
     def predict(self, df: pd.DataFrame, symbol: str) -> pd.DataFrame:
         """
-        Predict next 5 candles based on last 20 candles
+        Predict next 20 candles based on last 20 candles
         Args:
             df: DataFrame with at least 20 rows of OHLCV data
             symbol: Symbol name
@@ -546,8 +546,8 @@ if __name__ == "__main__":
         print("Training on historical data...")
         predictor.train(spy, "SPY", epochs=20)
         
-        # Predict next 5 candles
-        print("\nPredicting next 5 candles...")
+        # Predict next 20 candles
+        print("\nPredicting next 20 candles...")
         predictions = predictor.predict(spy, "SPY")
         print(predictions)
     else:

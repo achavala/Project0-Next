@@ -1393,8 +1393,11 @@ def get_market_data(symbol: str, period: str = "2d", interval: str = "1m", api: 
     # Helper function to validate data freshness
     def validate_data_freshness(data: pd.DataFrame, source: str) -> tuple[bool, str]:
         """
-        Validate that data is from today and not stale (>5 minutes old)
+        Validate that data is from today and not stale (>20 minutes old during market hours)
         Returns: (is_valid, error_message)
+        
+        During market hours: Allows data up to 20 minutes old (accounts for low-volume periods, API delays, and gaps)
+        Outside market hours: Allows data up to 60 minutes old
         
         🔴 RED-TEAM FIX: In backtest_mode, skip freshness checks (historical data is expected to be old)
         """
@@ -1425,13 +1428,14 @@ def get_market_data(symbol: str, period: str = "2d", interval: str = "1m", api: 
         if last_bar_date != today_est:
             return False, f"Data is from {last_bar_date}, not today ({today_est})"
         
-        # Check 2: Data must be fresh (< 5 minutes old during market hours)
+        # Check 2: Data must be fresh (< 20 minutes old during market hours)
         time_diff_minutes = (now_est - last_bar_est).total_seconds() / 60
         
-        # During market hours (9:30 AM - 4:00 PM EST), reject data > 5 minutes old
+        # During market hours (9:30 AM - 4:00 PM EST), allow up to 20 minutes old
+        # This accounts for low-volume periods, API delays, and gaps in trading
         # Outside market hours, allow up to 1 hour old (for pre/post market data)
         market_hours = 9.5 <= now_est.hour + (now_est.minute / 60) < 16.0
-        max_age_minutes = 5 if market_hours else 60
+        max_age_minutes = 20 if market_hours else 60
         
         if time_diff_minutes > max_age_minutes:
             return False, f"Data is {time_diff_minutes:.1f} minutes old (max: {max_age_minutes} min)"
@@ -4395,20 +4399,6 @@ def run_safe_live_trading():
                         
                         # Use final_action and final_confidence from combined signal (or RL if ensemble unavailable)
                         action = final_action
-                        action_strength = final_confidence
-                        
-                        # ========== BOOST CONFIDENCE WITH TECHNICAL ANALYSIS ==========
-                        if ta_pattern_detected and ta_confidence_boost > 0:
-                            # Boost confidence based on TA pattern
-                            base_confidence = action_strength
-                            boosted_confidence = min(0.95, base_confidence + ta_confidence_boost)
-                            action_strength = boosted_confidence
-                            
-                            risk_mgr.log(
-                                f"🚀 {sym} Confidence Boost: {base_confidence:.3f} → {boosted_confidence:.3f} "
-                                f"(+{ta_confidence_boost:.3f} from TA pattern: {ta_result['best_pattern']['pattern_type']})",
-                                "INFO"
-                            )
                         
                         # ❌ RESAMPLING REMOVED PER RED-TEAM REPORT
                         # The model is correctly uncertain - forcing trades via resampling
@@ -4436,6 +4426,20 @@ def run_safe_live_trading():
                         else:
                             # Use the action_source and action_strength from combined signal
                             action_strength = final_confidence
+                        
+                        # ========== BOOST CONFIDENCE WITH TECHNICAL ANALYSIS ==========
+                        # CRITICAL: Apply boost AFTER setting action_strength (not before, or it gets overwritten)
+                        if ta_pattern_detected and ta_confidence_boost > 0:
+                            # Boost confidence based on TA pattern
+                            base_confidence = action_strength
+                            boosted_confidence = min(0.95, base_confidence + ta_confidence_boost)
+                            action_strength = boosted_confidence
+                            
+                            risk_mgr.log(
+                                f"🚀 {sym} Confidence Boost: {base_confidence:.3f} → {boosted_confidence:.3f} "
+                                f"(+{ta_confidence_boost:.3f} from TA pattern: {ta_result['best_pattern']['pattern_type']})",
+                                "INFO"
+                            )
                         
                         action = int(action)
                         # Store per-symbol action with confidence and TA result (dict format)
@@ -4673,32 +4677,33 @@ def run_safe_live_trading():
                             )
                             continue  # Reject order
                     
-                    # Cross-validate with current_price (SPY) - should be close for similar ETFs
-                    if current_symbol in ['SPY', 'QQQ', 'IWM']:
+                    # Cross-validate: Only validate SPY against itself (not different ETFs)
+                    # Different ETFs (QQQ, IWM) have different price ranges, so we can't compare them to SPY
+                    if current_symbol == 'SPY':
+                        # For SPY, validate against the main SPY price (current_price)
                         price_diff = abs(symbol_price - current_price)
-                        price_diff_pct = price_diff / current_price if current_price > 0 else 0
-                        
-                        if price_diff > 5.0:  # More than $5 difference
+                        if price_diff > 2.0:  # More than $2 difference for same symbol is suspicious
+                            price_diff_pct = price_diff / current_price if current_price > 0 else 0
                             risk_mgr.log(
-                                f"❌ CRITICAL: {current_symbol} price ${symbol_price:.2f} differs from SPY ${current_price:.2f} "
-                                f"by ${price_diff:.2f} ({price_diff_pct:.1%}). Data may be stale. REJECTING ORDER.",
-                                "ERROR"
-                            )
-                            continue  # Reject order
-                        elif price_diff > 2.0:  # More than $2 difference
-                            risk_mgr.log(
-                                f"⚠️ WARNING: {current_symbol} price ${symbol_price:.2f} differs from SPY ${current_price:.2f} "
-                                f"by ${price_diff:.2f}. Proceeding with caution.",
+                                f"⚠️ WARNING: SPY price ${symbol_price:.2f} differs from main SPY price ${current_price:.2f} "
+                                f"by ${price_diff:.2f} ({price_diff_pct:.1%}). Proceeding with caution.",
                                 "WARNING"
                             )
                     
-                    # Log price source and validation
-                    risk_mgr.log(
-                        f"📊 Price Validation: {current_symbol} = ${symbol_price:.2f} | "
-                        f"SPY = ${current_price:.2f} | Diff: ${abs(symbol_price - current_price):.2f} | "
-                        f"Price is within expected range ✅",
-                        "INFO"
-                    )
+                    # Log price validation (without cross-symbol comparison for different ETFs)
+                    if current_symbol == 'SPY':
+                        risk_mgr.log(
+                            f"📊 Price Validation: {current_symbol} = ${symbol_price:.2f} | "
+                            f"Main SPY = ${current_price:.2f} | Diff: ${abs(symbol_price - current_price):.2f} | "
+                            f"Price is within expected range ✅",
+                            "INFO"
+                        )
+                    else:
+                        risk_mgr.log(
+                            f"📊 Price Validation: {current_symbol} = ${symbol_price:.2f} | "
+                            f"Price is within expected range ✅",
+                            "INFO"
+                        )
                     
                     # ========== USE TA-BASED STRIKE IF AVAILABLE ==========
                     # Check if we have TA analysis for this symbol

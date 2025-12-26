@@ -148,7 +148,7 @@ def train_model(symbols: list, epochs: int = 100, days: int = 30):
         try:
             predictions = predictor.predict(data, symbol)
             print(f"   Last Price: ${data['close'].iloc[-1]:.2f}")
-            print(f"   Predicted (5 candles):")
+            print(f"   Predicted (20 candles):")
             for i, (_, row) in enumerate(predictions.iterrows()):
                 print(f"      T+{i+1}: O=${row['open']:.2f} H=${row['high']:.2f} L=${row['low']:.2f} C=${row['close']:.2f}")
         except Exception as e:
