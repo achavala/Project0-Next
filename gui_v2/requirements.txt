@@ -1,0 +1,9 @@
+nicegui>=1.4.0
+pandas
+plotly
+alpaca-trade-api
+
+
+
+
+

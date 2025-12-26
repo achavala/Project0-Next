@@ -1,0 +1,126 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Documentation
+*.md
+*.txt
+!requirements.txt
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+venv_validation/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs and runtime files
+*.log
+*.pid
+logs/
+*.log.*
+
+# Data files and databases
+data/
+*.csv
+*.db
+*.sqlite
+*.sqlite3
+.env
+
+# Models (too large, should be downloaded or mounted)
+# Allow models directory and zip files within it (needed for trained historical model)
+models/checkpoints/
+models/*.zip
+!models/mike_historical_model.zip
+!models/mike_23feature_model_final.zip
+*.tar.gz
+*.pkl
+*.h5
+*.ckpt
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
+*.egg
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test files (but allow test_telegram*.py and get_chat_id.py for production testing)
+test_*.py
+!test_telegram.py
+!test_telegram_direct.py
+get_chat_id.py
+*_test.py
+*_tests.py
+
+# Backup files
+*.bak
+*.backup
+*_backup_*
+
+# Training artifacts
+training_logs/
+checkpoints/
+.ipynb_checkpoints
+
+# Mobile app and GUI
+mobile-app/
+gui_v2/
+
+# Dashboard data
+dashboard_data/
+
+# Large archives
+*.tar.gz
+*.zip
+
+# Avocado DB (submodule)
+avocadodb/
+
+# Scripts not needed in production
+*.sh
+!start_cloud.sh
+setup_*.sh
+deploy_*.sh
+monitor_*.sh
+check_*.sh
+run_*.sh
+start_*.sh
+!start_cloud.sh
+restart_*.sh
+validate_*.sh
+extract_*.sh
+collect_*.sh
+commit_*.sh
+daily_*.sh
+quick_*.sh
+show_*.sh
+
+# Config examples
+*.example
+config.py.example
+
+# Plist files
+*.plist
+
+# Platform-specific files (not needed for Fly.io)
+Procfile
+nixpacks.toml
+runtime.txt

@@ -1,0 +1,58 @@
+# Secrets
+config.py
+live_config.py
+paper_config.py
+.env
+
+# Models (but track training checkpoints)
+*.zip
+!models/*.zip
+mike_rl_model.zip
+mike_rl_agent.zip
+
+# Environment
+venv/
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+
+# Logs (but track training logs for progress monitoring)
+logs/
+*.log
+!training*.log
+!training_*.log
+mike.log
+mike_error.log
+streamlit.log
+
+# Data files (trading history, CSVs)
+*.csv
+mike_agent_trades.csv
+mike_agent_trades_*.csv
+test_trade.csv
+trade_history.csv
+
+# Training data files (too large for GitHub)
+data/historical/enriched/*.pkl
+*.pkl
+
+# Training packages (backup files)
+mike-agent-training-package_*.tar.gz
+*.tar.gz
+!requirements.txt
+
+# Databases
+*.db
+community_platform.db
+trades_database.db
+test_trades_database.db
+
+# Node modules and incomplete projects
+node_modules/
+dashboard/node_modules/
+mobile-app/node_modules/
+# Incomplete project directories (only contain node_modules)
+dashboard/
+mobile-app/
