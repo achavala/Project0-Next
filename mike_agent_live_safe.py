@@ -22,6 +22,17 @@ import pandas as pd
 import yfinance as yf  # Keep for VIX fallback
 from massive_api_client import MassiveAPIClient
 
+# Phase 0 & Phase 1 gates (architect review implementation)
+try:
+    from phase0_gates import (
+        Phase0Gates, Phase1Indicators, Phase1Ensemble,
+        run_phase0_phase1_checks, PHASE0, PHASE1
+    )
+    PHASE0_GATES_AVAILABLE = True
+except ImportError:
+    PHASE0_GATES_AVAILABLE = False
+    print("⚠️ phase0_gates.py not found - Phase 0/1 gates disabled")
+
 # Ensure /app is in Python path for imports (Fly.io deployment)
 if '/app' not in sys.path:
     sys.path.insert(0, '/app')
@@ -199,10 +210,12 @@ USE_INSTITUTIONAL_FEATURES = True  # Enable institutional-grade features
 # Symbols to trade (0DTE options)
 # NOTE: SPX options are NOT available in Alpaca paper trading (index options require special permissions)
 # Using SPY/QQQ/IWM (ETFs fully supported in paper trading)
-# 🔴 RED-TEAM FIX: Disable SPX (not available in paper), restrict IWM (lower liquidity)
-# Focus on SPY and QQQ only for now (highest liquidity, best fills)
-TRADING_SYMBOLS = ['SPY', 'QQQ']  # IWM disabled per red-team recommendation (lower liquidity)
-# SPX disabled (not available in Alpaca paper trading, requires special permissions)
+# 🔴 PHASE 0 FIX: Disable SPX, IWM per 4-architect review
+# - SPX: Not available in Alpaca paper trading
+# - IWM: Lower liquidity, worse fills
+# Focus on SPY and QQQ only (highest liquidity, best dealer flow, best fills)
+TRADING_SYMBOLS = ['SPY', 'QQQ']  # PHASE 0: Only SPY/QQQ allowed (highest liquidity)
+BLOCKED_SYMBOLS = ['SPX', 'IWM', '^SPX', 'SPXW']  # PHASE 0: Explicitly blocked symbols
 
 # ==================== RISK LIMITS (HARD-CODED – CANNOT BE OVERRIDDEN) ====================
 DAILY_LOSS_LIMIT = -0.15  # -15% daily loss limit
@@ -215,10 +228,11 @@ VIX_KILL = 28  # No trades if VIX > 28
 IVR_MIN = 30  # Minimum IV Rank (0-100)
 # Entry time filter (disabled per user request)
 NO_TRADE_AFTER = None  # type: Optional[str]  # No time restriction - trading allowed all day
-# 🔴 RED-TEAM FIX: Raise confidence threshold (do NOT lower it)
-# Model is correctly uncertain - 0.52 is too low and causes losses
+# 🔴 PHASE 0 FIX: Raise confidence threshold to 0.70 (per 4-architect review)
+# Model is correctly uncertain - 0.52-0.60 is too low and causes losses
 # Better to have zero trades than trades with low confidence
-MIN_ACTION_STRENGTH_THRESHOLD = 0.60  # Minimum confidence (0.60 = 60%) required to execute trades
+# "The model is correctly uncertain" - forcing trades causes losses
+MIN_ACTION_STRENGTH_THRESHOLD = 0.70  # Minimum confidence (0.70 = 70%) required to execute trades
 MAX_DRAWDOWN = 0.30  # Full shutdown if -30% from peak
 MAX_NOTIONAL = 50000  # Max $50k notional per order
 DUPLICATE_ORDER_WINDOW = 300  # 5 minutes in seconds (per symbol)
@@ -802,47 +816,140 @@ class RiskManager:
             option_type: 'call' or 'put' (for expected move calculation)
         Returns: (is_safe, reason_if_unsafe)
         """
-        # ========== 🔴 RED-TEAM FIX: TRADE GATING (HARD VETOES) ==========
-        # These gates MUST pass before any trade - no exceptions
-        # Phase 0.2: Block trades when spread > X%, quote age > threshold, expected move < breakeven
+        # ========== 🔴 PHASE 0: HARD TRADE GATES (PER 4-ARCHITECT REVIEW) ==========
+        # These gates MUST pass before any trade - NO EXCEPTIONS
+        # "This single rule would eliminate most losses" - regarding expected move gate
         if is_entry and current_price and strike and option_type:
-            # Gate 1: Spread check (if we can get bid/ask)
+            
+            # ===== GATE 1: SPREAD CHECK (Tightened to 15% per Phase 0) =====
+            # "Most 0-DTE losses occur when liquidity evaporates, not because direction was wrong"
+            snapshot = None
+            quote_timestamp = None
             try:
                 # Try to get option snapshot for bid/ask spread
                 snapshot = api.get_option_snapshot(symbol)
                 if snapshot and hasattr(snapshot, 'bid_price') and hasattr(snapshot, 'ask_price'):
                     bid = float(snapshot.bid_price) if snapshot.bid_price else 0
                     ask = float(snapshot.ask_price) if snapshot.ask_price else 0
+                    
+                    # Get quote timestamp if available
+                    if hasattr(snapshot, 'updated_at'):
+                        quote_timestamp = snapshot.updated_at
+                    elif hasattr(snapshot, 'timestamp'):
+                        quote_timestamp = snapshot.timestamp
+                    
                     if bid > 0 and ask > 0:
                         spread = ask - bid
-                        spread_pct = (spread / premium) * 100 if premium > 0 else 100
-                        MAX_SPREAD_PCT = 20.0  # Block if spread > 20% of premium (0DTE can have wide spreads)
+                        mid_price = (bid + ask) / 2.0
+                        spread_pct = (spread / mid_price) * 100 if mid_price > 0 else 100
+                        
+                        # PHASE 0: Tightened from 20% to 15%
+                        MAX_SPREAD_PCT = 15.0  # Block if spread > 15% of mid-price
+                        MAX_SPREAD_ABSOLUTE = 0.10  # Block if spread > $0.10 absolute
+                        
                         if spread_pct > MAX_SPREAD_PCT:
-                            return False, f"⛔ BLOCKED: Spread too wide ({spread_pct:.1f}% of premium ${premium:.2f}) | Bid: ${bid:.2f}, Ask: ${ask:.2f} | Max allowed: {MAX_SPREAD_PCT}%"
+                            return False, f"⛔ P0-GATE: Spread too wide ({spread_pct:.1f}% > {MAX_SPREAD_PCT}%) | Bid: ${bid:.2f}, Ask: ${ask:.2f}"
+                        
+                        if spread > MAX_SPREAD_ABSOLUTE:
+                            return False, f"⛔ P0-GATE: Spread too wide (${spread:.2f} > ${MAX_SPREAD_ABSOLUTE:.2f}) | Bid: ${bid:.2f}, Ask: ${ask:.2f}"
+                        
+                        self.log(f"✅ P0 Spread OK: {spread_pct:.1f}% (${spread:.2f}) | Bid: ${bid:.2f}, Ask: ${ask:.2f}", "DEBUG")
             except Exception as e:
-                # If we can't get spread, log but don't block (data may not be available)
-                self.log(f"⚠️ Could not check spread for {symbol}: {e}", "WARNING")
+                # PHASE 0: Stricter - if we can't get spread, block the trade
+                return False, f"⛔ P0-GATE: Cannot verify spread for {symbol} (data unavailable): {e}"
             
-            # Gate 2: Expected move vs breakeven (CRITICAL - this eliminates most losses)
+            # ===== GATE 2: QUOTE AGE CHECK (Max 5 seconds per Phase 0) =====
+            # "Stale quotes kill 0-DTE traders"
+            if quote_timestamp:
+                try:
+                    import pytz
+                    now_utc = datetime.now(pytz.UTC)
+                    
+                    # Ensure quote_timestamp is timezone-aware
+                    if hasattr(quote_timestamp, 'tzinfo') and quote_timestamp.tzinfo is None:
+                        quote_timestamp = pytz.UTC.localize(quote_timestamp)
+                    
+                    quote_age_seconds = (now_utc - quote_timestamp).total_seconds()
+                    MAX_QUOTE_AGE_SECONDS = 5  # Block if quote > 5 seconds old
+                    
+                    if quote_age_seconds > MAX_QUOTE_AGE_SECONDS:
+                        return False, f"⛔ P0-GATE: Quote too stale ({quote_age_seconds:.1f}s > {MAX_QUOTE_AGE_SECONDS}s) | Waiting for fresh quote"
+                    
+                    self.log(f"✅ P0 Quote Age OK: {quote_age_seconds:.1f}s", "DEBUG")
+                except Exception as e:
+                    self.log(f"⚠️ Could not check quote age: {e}", "WARNING")
+            
+            # ===== GATE 3: EXPECTED MOVE VS BREAKEVEN (THE CRITICAL GATE) =====
+            # "This single rule would eliminate most losses"
+            # Expected move must be >= 1.2x breakeven (20% edge required)
             try:
-                # Calculate expected move (simplified: use VIX/16 * sqrt(days_to_expiry))
                 vix = self.get_current_vix()
-                days_to_expiry = 1.0 / (252 * 6.5)  # 0DTE: ~1 trading day = 1/(252*6.5) years
-                expected_move_pct = (vix / 16.0) * (days_to_expiry ** 0.5) * 100  # Annualized to daily
-                expected_move_dollars = current_price * (expected_move_pct / 100)
+                
+                # For 0DTE, calculate intraday expected move
+                # Using VIX1D if available (via Phase 1 indicators), else approximate from VIX
+                hours_to_expiry = 6.5  # Full trading day
+                est = pytz.timezone('US/Eastern')
+                now_est = datetime.now(est)
+                market_close = now_est.replace(hour=16, minute=0, second=0, microsecond=0)
+                if now_est < market_close:
+                    hours_to_expiry = (market_close - now_est).total_seconds() / 3600
+                hours_to_expiry = max(0.5, hours_to_expiry)  # Minimum 30 minutes
+                
+                # VIX is annualized 30-day vol. For 0DTE, we need intraday vol.
+                # Approximate: VIX * sqrt(hours_to_expiry / (252 * 6.5))
+                time_fraction = hours_to_expiry / (252 * 6.5)
+                expected_move_pct = (vix / 100.0) * (time_fraction ** 0.5)
+                expected_move_dollars = current_price * expected_move_pct
                 
                 # Calculate breakeven move needed
                 if option_type.lower() == 'call':
-                    breakeven_move = strike + premium - current_price  # Need price to move above strike+premium
+                    breakeven_move = max(0, strike + premium - current_price)
                 else:  # put
-                    breakeven_move = current_price - (strike - premium)  # Need price to move below strike-premium
+                    breakeven_move = max(0, current_price - (strike - premium))
                 
-                # CRITICAL GATE: Expected move must be >= breakeven move
-                if expected_move_dollars < abs(breakeven_move):
-                    return False, f"⛔ BLOCKED: Expected move (${expected_move_dollars:.2f}) < Breakeven move (${abs(breakeven_move):.2f}) | VIX: {vix:.1f} | This trade needs more volatility to be profitable"
+                # PHASE 0: Expected move must be >= 1.2x breakeven (20% edge)
+                MIN_EXPECTED_MOVE_RATIO = 1.2
+                
+                if breakeven_move > 0:
+                    ratio = expected_move_dollars / breakeven_move
+                    if ratio < MIN_EXPECTED_MOVE_RATIO:
+                        return False, (
+                            f"⛔ P0-GATE: No edge - Expected move ${expected_move_dollars:.2f} < "
+                            f"{MIN_EXPECTED_MOVE_RATIO:.1f}x breakeven ${breakeven_move:.2f} (ratio={ratio:.2f}) | "
+                            f"VIX: {vix:.1f} | Hours left: {hours_to_expiry:.1f}"
+                        )
+                    self.log(f"✅ P0 Expected Move OK: ratio={ratio:.2f} (${expected_move_dollars:.2f}/${breakeven_move:.2f})", "DEBUG")
             except Exception as e:
-                # If calculation fails, log but don't block (may be data issue)
-                self.log(f"⚠️ Could not calculate expected move for {symbol}: {e}", "WARNING")
+                # PHASE 0: Stricter - if we can't calculate expected move, block
+                return False, f"⛔ P0-GATE: Cannot calculate expected move: {e}"
+            
+            # ===== GATE 4: MINIMUM LIQUIDITY (Volume + OI) =====
+            # "Most 0-DTE losses occur when liquidity evaporates"
+            MIN_OPTION_VOLUME = 100
+            MIN_OPEN_INTEREST = 500
+            
+            if snapshot:
+                try:
+                    option_volume = 0
+                    open_interest = 0
+                    
+                    if hasattr(snapshot, 'day_volume'):
+                        option_volume = int(snapshot.day_volume) if snapshot.day_volume else 0
+                    elif hasattr(snapshot, 'volume'):
+                        option_volume = int(snapshot.volume) if snapshot.volume else 0
+                    
+                    if hasattr(snapshot, 'open_interest'):
+                        open_interest = int(snapshot.open_interest) if snapshot.open_interest else 0
+                    
+                    if option_volume < MIN_OPTION_VOLUME:
+                        return False, f"⛔ P0-GATE: Low option volume ({option_volume} < {MIN_OPTION_VOLUME}) | Liquidity risk"
+                    
+                    if open_interest < MIN_OPEN_INTEREST:
+                        return False, f"⛔ P0-GATE: Low open interest ({open_interest} < {MIN_OPEN_INTEREST}) | Liquidity risk"
+                    
+                    self.log(f"✅ P0 Liquidity OK: Volume={option_volume}, OI={open_interest}", "DEBUG")
+                except Exception as e:
+                    self.log(f"⚠️ Could not check option liquidity: {e}", "WARNING")
         
         # ========== SAFEGUARD 7: Order Size Sanity Check ==========
         # For options, notional = premium cost = qty * premium * 100
@@ -1393,11 +1500,8 @@ def get_market_data(symbol: str, period: str = "2d", interval: str = "1m", api: 
     # Helper function to validate data freshness
     def validate_data_freshness(data: pd.DataFrame, source: str) -> tuple[bool, str]:
         """
-        Validate that data is from today and not stale (>20 minutes old during market hours)
+        Validate that data is from today and not stale (>5 minutes old)
         Returns: (is_valid, error_message)
-        
-        During market hours: Allows data up to 20 minutes old (accounts for low-volume periods, API delays, and gaps)
-        Outside market hours: Allows data up to 60 minutes old
         
         🔴 RED-TEAM FIX: In backtest_mode, skip freshness checks (historical data is expected to be old)
         """
@@ -1428,14 +1532,13 @@ def get_market_data(symbol: str, period: str = "2d", interval: str = "1m", api: 
         if last_bar_date != today_est:
             return False, f"Data is from {last_bar_date}, not today ({today_est})"
         
-        # Check 2: Data must be fresh (< 20 minutes old during market hours)
+        # Check 2: Data must be fresh (< 5 minutes old during market hours)
         time_diff_minutes = (now_est - last_bar_est).total_seconds() / 60
         
-        # During market hours (9:30 AM - 4:00 PM EST), allow up to 20 minutes old
-        # This accounts for low-volume periods, API delays, and gaps in trading
+        # During market hours (9:30 AM - 4:00 PM EST), reject data > 5 minutes old
         # Outside market hours, allow up to 1 hour old (for pre/post market data)
         market_hours = 9.5 <= now_est.hour + (now_est.minute / 60) < 16.0
-        max_age_minutes = 20 if market_hours else 60
+        max_age_minutes = 5 if market_hours else 60
         
         if time_diff_minutes > max_age_minutes:
             return False, f"Data is {time_diff_minutes:.1f} minutes old (max: {max_age_minutes} min)"
@@ -3570,13 +3673,43 @@ def run_safe_live_trading():
     time = time_module
     del time_module
     
-    # ========== LIVE AGENT LOCK (PREVENTS BACKTEST INTERFERENCE) ==========
-    # Create lock file to indicate live agent is running
+    # ========== PHASE 0: SINGLE INSTANCE ENFORCEMENT ==========
+    # Prevent multiple trading instances (per 4-architect review)
     LIVE_AGENT_LOCK_FILE = "/tmp/mike_agent_live.lock"
     LIVE_AGENT_PID_FILE = "/tmp/mike_agent_live.pid"
     
+    # Check if another instance is already running
+    if os.path.exists(LIVE_AGENT_PID_FILE):
+        try:
+            with open(LIVE_AGENT_PID_FILE, 'r') as f:
+                existing_pid = int(f.read().strip())
+            # Check if process is still running
+            try:
+                os.kill(existing_pid, 0)  # Signal 0 = check if exists
+                # Process exists - another instance is running
+                print("=" * 70)
+                print("❌ PHASE 0: SINGLE INSTANCE VIOLATION DETECTED")
+                print("=" * 70)
+                print(f"Another Mike Agent instance (PID {existing_pid}) is already running!")
+                print("Per 4-architect review: Only ONE live trading instance is allowed.")
+                print("")
+                print("To resolve:")
+                print(f"  1. Kill existing instance: kill {existing_pid}")
+                print(f"  2. Or remove stale lock: rm {LIVE_AGENT_PID_FILE}")
+                print("=" * 70)
+                sys.exit(1)
+            except OSError:
+                # Process doesn't exist - stale lock file
+                print(f"🧹 Cleaning stale lock file (PID {existing_pid} no longer running)")
+                os.remove(LIVE_AGENT_PID_FILE)
+                if os.path.exists(LIVE_AGENT_LOCK_FILE):
+                    os.remove(LIVE_AGENT_LOCK_FILE)
+        except (ValueError, IOError) as e:
+            print(f"⚠️ Could not read PID file, removing: {e}")
+            os.remove(LIVE_AGENT_PID_FILE)
+    
+    # Create lock file
     try:
-        # Create lock file
         est = pytz.timezone('US/Eastern')
         now_est = datetime.now(est)
         with open(LIVE_AGENT_LOCK_FILE, 'w') as f:
@@ -3587,10 +3720,9 @@ def run_safe_live_trading():
         with open(LIVE_AGENT_PID_FILE, 'w') as f:
             f.write(str(os.getpid()))
         
-        print(f"✅ Live agent lock created: {LIVE_AGENT_LOCK_FILE}")
-        print(f"✅ PID saved: {LIVE_AGENT_PID_FILE}")
+        print(f"✅ Single instance lock acquired (PID: {os.getpid()})")
     except Exception as e:
-        print(f"⚠️  Could not create lock file: {e}")
+        print(f"⚠️ Could not create lock file: {e}")
     
     # Cleanup function to remove lock on exit
     def cleanup_lock():
@@ -4327,78 +4459,140 @@ def run_safe_live_trading():
                                 import traceback
                                 risk_mgr.log(traceback.format_exc(), "DEBUG")
                         
-                        # ========== COMBINE RL + ENSEMBLE SIGNALS ==========
-                        # Hierarchical combination: Risk > Macro > Volatility > Gamma > Trend > Reversal > RL
-                        # RL weight: 40% (lower priority in hierarchy)
-                        # Ensemble weight: 60% (higher priority)
-                        RL_WEIGHT = 0.40
-                        ENSEMBLE_WEIGHT = 0.60
+                        # ========== PHASE 1: RL ROLE RESTRICTIONS ==========
+                        # Per 4-architect review:
+                        # "RL should NOT be your entry generator"
+                        # "You are asking RL to predict price direction, but 0-DTE success 
+                        #  comes from predicting when convexity will pay"
+                        #
+                        # Correct RL role in 0-DTE:
+                        # - Sizing: RL can adjust position size
+                        # - Timing: RL can refine entry timing within ensemble signal
+                        # - Exit: RL is excellent for exit/trim decisions (strong fit)
+                        # - Entry signals: ENSEMBLE ONLY (RL is demoted)
+                        #
+                        # Old approach (wrong):
+                        #   RL_WEIGHT = 0.40, ENSEMBLE_WEIGHT = 0.60
+                        # New approach (Phase 1):
+                        #   For ENTRIES: Ensemble ONLY (RL demoted to 0% for direction)
+                        #   For EXITS: RL can contribute (still useful for exit timing)
+                        
+                        RL_ENTRY_WEIGHT = 0.0   # Phase 1: RL has NO WEIGHT for entry direction
+                        ENSEMBLE_ENTRY_WEIGHT = 1.0  # Ensemble decides entries
+                        RL_EXIT_WEIGHT = 0.6    # RL is still good at exits
+                        ENSEMBLE_EXIT_WEIGHT = 0.4
                         
                         # Confidence override rules
                         MIN_CONFIDENCE_THRESHOLD = 0.3
                         
                         if ensemble_action is not None:
-                            # Check for confidence overrides
-                            if ensemble_confidence < MIN_CONFIDENCE_THRESHOLD and action_strength > MIN_CONFIDENCE_THRESHOLD:
-                                # Ensemble too weak, use RL
-                                final_action = rl_action
-                                final_confidence = action_strength
-                                action_source = "RL (ensemble low confidence)"
-                                risk_mgr.log(
-                                    f"⚠️ {sym} Ensemble confidence too low ({ensemble_confidence:.2f}), using RL signal",
-                                    "WARNING"
-                                )
-                            elif action_strength < MIN_CONFIDENCE_THRESHOLD and ensemble_confidence > MIN_CONFIDENCE_THRESHOLD:
-                                # RL too weak, use ensemble
+                            # ===== PHASE 1: ENTRY DECISIONS - ENSEMBLE ONLY =====
+                            # For entry signals (BUY_CALL=1, BUY_PUT=2), use ensemble exclusively
+                            if ensemble_action in [1, 2]:  # Entry signal from ensemble
                                 final_action = ensemble_action
                                 final_confidence = ensemble_confidence
-                                action_source = "Ensemble (RL low confidence)"
+                                action_source = "Ensemble (P1: RL demoted for entries)"
+                                
+                                # RL can VETO weak ensemble signals, but can't generate its own
+                                if rl_action == 0 and action_strength > 0.7:
+                                    # RL strongly says HOLD - respect it as a veto
+                                    risk_mgr.log(
+                                        f"⚠️ {sym} RL VETO: RL says HOLD (conf={action_strength:.2f}) vs "
+                                        f"Ensemble says {get_action_name(ensemble_action)} (conf={ensemble_confidence:.2f})",
+                                        "WARNING"
+                                    )
+                                    final_action = 0  # HOLD
+                                    final_confidence = 0.4
+                                    action_source = "RL_VETO (Ensemble entry blocked)"
+                                else:
+                                    risk_mgr.log(
+                                        f"🎯 {sym} Entry Signal: Ensemble={get_action_name(ensemble_action)} "
+                                        f"(conf={ensemble_confidence:.2f}) | RL demoted per Phase 1",
+                                        "INFO"
+                                    )
+                            
+                            # ===== PHASE 1: HOLD DECISIONS =====
+                            elif ensemble_action == 0:  # HOLD from ensemble
+                                # If both say HOLD, definitely HOLD
+                                if rl_action == 0:
+                                    final_action = 0
+                                    final_confidence = max(ensemble_confidence, action_strength)
+                                    action_source = "Ensemble+RL (both HOLD)"
+                                # If RL has a strong entry signal but ensemble says HOLD
+                                # → Ensemble wins (RL can't generate entries per Phase 1)
+                                elif rl_action in [1, 2] and action_strength > 0.8:
+                                    risk_mgr.log(
+                                        f"⚠️ {sym} RL wants {get_action_name(rl_action)} (conf={action_strength:.2f}) "
+                                        f"but Ensemble says HOLD. Phase 1: Ensemble wins for entries.",
+                                        "WARNING"
+                                    )
+                                    final_action = 0  # HOLD
+                                    final_confidence = ensemble_confidence
+                                    action_source = "Ensemble (RL entry blocked per P1)"
+                                else:
+                                    final_action = 0
+                                    final_confidence = ensemble_confidence
+                                    action_source = "Ensemble (HOLD)"
+                            
+                            # ===== PHASE 1: EXIT DECISIONS - RL CONTRIBUTES =====
+                            # For exit signals (TRIM/EXIT), RL is still useful
+                            elif ensemble_action >= 3:  # Exit signal
+                                # Blend RL and ensemble for exits (RL is good at this)
+                                if rl_action >= 3:
+                                    # Both agree on exit
+                                    final_action = ensemble_action
+                                    final_confidence = (RL_EXIT_WEIGHT * action_strength + 
+                                                       ENSEMBLE_EXIT_WEIGHT * ensemble_confidence)
+                                    action_source = "RL+Ensemble (exit consensus)"
+                                else:
+                                    # Ensemble says exit but RL doesn't
+                                    final_action = ensemble_action
+                                    final_confidence = ensemble_confidence * 0.8  # Slight penalty
+                                    action_source = "Ensemble (exit, RL disagrees)"
+                            else:
+                                # Fallback
+                                final_action = ensemble_action
+                                final_confidence = ensemble_confidence
+                                action_source = "Ensemble"
+                        
+                        else:
+                            # ===== NO ENSEMBLE AVAILABLE - PHASE 1 FALLBACK =====
+                            # Without ensemble, RL can only suggest HOLD or EXIT
+                            # It CANNOT generate entry signals per Phase 1
+                            if rl_action in [1, 2]:  # RL wants to buy
                                 risk_mgr.log(
-                                    f"⚠️ {sym} RL confidence too low ({action_strength:.2f}), using ensemble signal",
+                                    f"⚠️ {sym} No ensemble available. RL wants {get_action_name(rl_action)} "
+                                    f"but per Phase 1, RL cannot generate entries. Defaulting to HOLD.",
                                     "WARNING"
                                 )
-                            else:
-                                # Both have reasonable confidence: combine with hierarchical weights
-                                action_scores = {0: 0.0, 1: 0.0, 2: 0.0}  # HOLD, BUY_CALL, BUY_PUT
-                                
-                                # Ensemble contribution (higher weight - higher in hierarchy)
-                                if ensemble_action in action_scores:
-                                    action_scores[ensemble_action] += ENSEMBLE_WEIGHT * ensemble_confidence
-                                
-                                # RL contribution (lower weight - lower in hierarchy)
-                                if rl_action in action_scores:
-                                    action_scores[rl_action] += RL_WEIGHT * action_strength
-                                
-                                # Select winning action
-                                combined_action = max(action_scores, key=action_scores.get)
-                                combined_confidence = action_scores[combined_action]
-                                
-                                # Normalize confidence
-                                total_score = sum(action_scores.values())
-                                if total_score > 0:
-                                    combined_confidence = combined_confidence / total_score
-                                else:
-                                    combined_confidence = 0.0
-                                
-                                # Use combined signal
-                                final_action = combined_action
-                                final_confidence = combined_confidence
-                                action_source = "RL+Ensemble"
-                                
-                                risk_mgr.log(
-                                    f"🔀 {sym} Combined Signal: RL={rl_action}({action_strength:.2f}) + "
-                                    f"Ensemble={ensemble_action}({ensemble_confidence:.2f}) → "
-                                    f"Final={final_action}({final_confidence:.2f})",
-                                    "INFO"
-                                )
-                        else:
-                            # Use RL only if ensemble unavailable
-                            final_action = rl_action
-                            final_confidence = action_strength
-                            action_source = "RL"
+                                final_action = 0  # HOLD
+                                final_confidence = 0.3
+                                action_source = "P1_FALLBACK (RL entry blocked, no ensemble)"
+                            elif rl_action >= 3:  # RL suggests exit
+                                final_action = rl_action
+                                final_confidence = action_strength
+                                action_source = "RL (exit only, no ensemble)"
+                            else:  # RL says HOLD
+                                final_action = 0
+                                final_confidence = action_strength
+                                action_source = "RL (HOLD, no ensemble)"
                         
                         # Use final_action and final_confidence from combined signal (or RL if ensemble unavailable)
                         action = final_action
+                        action_strength = final_confidence
+                        
+                        # ========== BOOST CONFIDENCE WITH TECHNICAL ANALYSIS ==========
+                        if ta_pattern_detected and ta_confidence_boost > 0:
+                            # Boost confidence based on TA pattern
+                            base_confidence = action_strength
+                            boosted_confidence = min(0.95, base_confidence + ta_confidence_boost)
+                            action_strength = boosted_confidence
+                            
+                            risk_mgr.log(
+                                f"🚀 {sym} Confidence Boost: {base_confidence:.3f} → {boosted_confidence:.3f} "
+                                f"(+{ta_confidence_boost:.3f} from TA pattern: {ta_result['best_pattern']['pattern_type']})",
+                                "INFO"
+                            )
                         
                         # ❌ RESAMPLING REMOVED PER RED-TEAM REPORT
                         # The model is correctly uncertain - forcing trades via resampling
@@ -4426,20 +4620,6 @@ def run_safe_live_trading():
                         else:
                             # Use the action_source and action_strength from combined signal
                             action_strength = final_confidence
-                        
-                        # ========== BOOST CONFIDENCE WITH TECHNICAL ANALYSIS ==========
-                        # CRITICAL: Apply boost AFTER setting action_strength (not before, or it gets overwritten)
-                        if ta_pattern_detected and ta_confidence_boost > 0:
-                            # Boost confidence based on TA pattern
-                            base_confidence = action_strength
-                            boosted_confidence = min(0.95, base_confidence + ta_confidence_boost)
-                            action_strength = boosted_confidence
-                            
-                            risk_mgr.log(
-                                f"🚀 {sym} Confidence Boost: {base_confidence:.3f} → {boosted_confidence:.3f} "
-                                f"(+{ta_confidence_boost:.3f} from TA pattern: {ta_result['best_pattern']['pattern_type']})",
-                                "INFO"
-                            )
                         
                         action = int(action)
                         # Store per-symbol action with confidence and TA result (dict format)
@@ -4677,33 +4857,32 @@ def run_safe_live_trading():
                             )
                             continue  # Reject order
                     
-                    # Cross-validate: Only validate SPY against itself (not different ETFs)
-                    # Different ETFs (QQQ, IWM) have different price ranges, so we can't compare them to SPY
-                    if current_symbol == 'SPY':
-                        # For SPY, validate against the main SPY price (current_price)
+                    # Cross-validate with current_price (SPY) - should be close for similar ETFs
+                    if current_symbol in ['SPY', 'QQQ', 'IWM']:
                         price_diff = abs(symbol_price - current_price)
-                        if price_diff > 2.0:  # More than $2 difference for same symbol is suspicious
-                            price_diff_pct = price_diff / current_price if current_price > 0 else 0
+                        price_diff_pct = price_diff / current_price if current_price > 0 else 0
+                        
+                        if price_diff > 5.0:  # More than $5 difference
                             risk_mgr.log(
-                                f"⚠️ WARNING: SPY price ${symbol_price:.2f} differs from main SPY price ${current_price:.2f} "
-                                f"by ${price_diff:.2f} ({price_diff_pct:.1%}). Proceeding with caution.",
+                                f"❌ CRITICAL: {current_symbol} price ${symbol_price:.2f} differs from SPY ${current_price:.2f} "
+                                f"by ${price_diff:.2f} ({price_diff_pct:.1%}). Data may be stale. REJECTING ORDER.",
+                                "ERROR"
+                            )
+                            continue  # Reject order
+                        elif price_diff > 2.0:  # More than $2 difference
+                            risk_mgr.log(
+                                f"⚠️ WARNING: {current_symbol} price ${symbol_price:.2f} differs from SPY ${current_price:.2f} "
+                                f"by ${price_diff:.2f}. Proceeding with caution.",
                                 "WARNING"
                             )
                     
-                    # Log price validation (without cross-symbol comparison for different ETFs)
-                    if current_symbol == 'SPY':
-                        risk_mgr.log(
-                            f"📊 Price Validation: {current_symbol} = ${symbol_price:.2f} | "
-                            f"Main SPY = ${current_price:.2f} | Diff: ${abs(symbol_price - current_price):.2f} | "
-                            f"Price is within expected range ✅",
-                            "INFO"
-                        )
-                    else:
-                        risk_mgr.log(
-                            f"📊 Price Validation: {current_symbol} = ${symbol_price:.2f} | "
-                            f"Price is within expected range ✅",
-                            "INFO"
-                        )
+                    # Log price source and validation
+                    risk_mgr.log(
+                        f"📊 Price Validation: {current_symbol} = ${symbol_price:.2f} | "
+                        f"SPY = ${current_price:.2f} | Diff: ${abs(symbol_price - current_price):.2f} | "
+                        f"Price is within expected range ✅",
+                        "INFO"
+                    )
                     
                     # ========== USE TA-BASED STRIKE IF AVAILABLE ==========
                     # Check if we have TA analysis for this symbol

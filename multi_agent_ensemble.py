@@ -1016,91 +1016,226 @@ class MetaPolicyRouter:
         if total_weight > 0:
             weights = {k: v / total_weight for k, v in weights.items()}
         
-        # Apply hierarchical overrides
-        signals = self._apply_hierarchical_overrides(signals, weights)
+        # ========== PHASE 1: GATING ENSEMBLE (NOT AVERAGING) ==========
+        # Per 4-architect review: "Ensembles SELECT, they don't average"
+        # Problem with averaging:
+        # - Trend: 0.8 BUY + Reversal: 0.2 SELL → 0.5 DO NOTHING
+        # - Result: Miss both breakouts AND ranges
+        #
+        # Solution (gating):
+        # - Detect regime first
+        # - Select appropriate agent(s)
+        # - IGNORE conflicting agents
         
-        # Weighted voting with normalized confidence
-        action_scores = {0: 0.0, 1: 0.0, 2: 0.0}  # HOLD, BUY_CALL, BUY_PUT
+        USE_GATING_ENSEMBLE = True  # Phase 1 flag
         
-        for signal in signals:
-            weight = weights.get(signal.agent_type, 0.10)
-            # Normalized confidence (already clamped to [0, 1])
-            confidence_weight = signal.confidence
-            combined_weight = weight * confidence_weight
-            
-            action_scores[signal.action] += combined_weight
-        
-        # Find winning action
-        final_action = max(action_scores, key=action_scores.get)
-        final_confidence = action_scores[final_action]
-        
-        # Normalize confidence using softmax for better scaling
-        total_score = sum(action_scores.values())
-        if total_score > 0:
-            # Softmax normalization for smoother confidence
-            import math
-            exp_scores = {k: math.exp(v * 2) for k, v in action_scores.items()}  # Scale by 2 for sharper
-            sum_exp = sum(exp_scores.values())
-            final_confidence = exp_scores[final_action] / sum_exp if sum_exp > 0 else 0.0
-        else:
-            final_confidence = 0.0
-        
-        # Apply confidence override rules
-        # Note: min_confidence_threshold is typically 0.3, but we want to allow signals at 0.3
-        # So we only override if confidence is significantly below threshold
-        if final_confidence < max(0.1, self.min_confidence_threshold * 0.5):
-            # Very low confidence: default to HOLD
+        if USE_GATING_ENSEMBLE:
+            # ===== REGIME-BASED AGENT SELECTION (GATING) =====
             final_action = 0
-            final_confidence = 0.3  # Low confidence HOLD (but still return 0.3 to allow threshold checks)
+            final_confidence = 0.0
+            gating_source = ""
+            
+            # 1. CHAOS REGIME: Don't trade - VETO everything
+            if regime == 'chaos':
+                final_action = 0
+                final_confidence = 0.0
+                gating_source = "CHAOS_REGIME_VETO"
+            
+            # 2. VOLATILE/HIGH-VIX: Check volatility agent FIRST, ignore trend/reversal
+            elif regime in ['volatile', 'storm'] or vix > 25:
+                # In high vol: only trust volatility agent
+                # Trend/reversal are unreliable in high vol
+                if volatility_signal.confidence > 0.6:
+                    final_action = volatility_signal.action
+                    final_confidence = volatility_signal.confidence
+                    gating_source = "VOL_AGENT_SELECTED"
+                else:
+                    # No strong vol signal: HOLD (don't force trades)
+                    final_action = 0
+                    final_confidence = 0.3
+                    gating_source = "HIGH_VOL_NO_SIGNAL"
+            
+            # 3. TRENDING REGIME: Use trend agent, IGNORE reversal
+            elif regime == 'trending':
+                if trend_signal.confidence > 0.5:
+                    final_action = trend_signal.action
+                    final_confidence = trend_signal.confidence
+                    gating_source = "TREND_AGENT_SELECTED"
+                elif macro_signal.confidence > 0.7:
+                    # Strong macro signal as backup
+                    final_action = macro_signal.action
+                    final_confidence = macro_signal.confidence * 0.8
+                    gating_source = "MACRO_BACKUP_TRENDING"
+                else:
+                    final_action = 0
+                    final_confidence = 0.3
+                    gating_source = "TREND_REGIME_NO_SIGNAL"
+            
+            # 4. MEAN-REVERTING REGIME: Use reversal agent, IGNORE trend
+            elif regime == 'mean_reverting':
+                if reversal_signal.confidence > 0.5:
+                    final_action = reversal_signal.action
+                    final_confidence = reversal_signal.confidence
+                    gating_source = "REVERSAL_AGENT_SELECTED"
+                else:
+                    final_action = 0
+                    final_confidence = 0.3
+                    gating_source = "REVERSAL_REGIME_NO_SIGNAL"
+            
+            # 5. CALM/LOW-VOL: Only trade high-confidence volatility breakout or light mean reversion
+            elif regime == 'calm' or vix < 12:
+                # In calm: wait for breakout OR light mean reversion
+                if volatility_signal.confidence > 0.8:
+                    # Strong breakout signal
+                    final_action = volatility_signal.action
+                    final_confidence = volatility_signal.confidence
+                    gating_source = "CALM_VOL_BREAKOUT"
+                elif reversal_signal.confidence > 0.75:
+                    # Strong mean reversion in calm market
+                    final_action = reversal_signal.action
+                    final_confidence = reversal_signal.confidence * 0.8
+                    gating_source = "CALM_REVERSAL"
+                else:
+                    final_action = 0
+                    final_confidence = 0.3
+                    gating_source = "CALM_NO_SIGNAL"
+            
+            # 6. DEFAULT/MIXED: Fall back to hierarchical with higher threshold
+            else:
+                # Require strong agreement between agents
+                buy_call_votes = sum(1 for s in signals if s.action == 1 and s.confidence > 0.6)
+                buy_put_votes = sum(1 for s in signals if s.action == 2 and s.confidence > 0.6)
+                
+                if buy_call_votes >= 3:  # Majority consensus
+                    final_action = 1
+                    final_confidence = sum(s.confidence for s in signals if s.action == 1) / max(1, buy_call_votes)
+                    gating_source = "CONSENSUS_BUY_CALL"
+                elif buy_put_votes >= 3:
+                    final_action = 2
+                    final_confidence = sum(s.confidence for s in signals if s.action == 2) / max(1, buy_put_votes)
+                    gating_source = "CONSENSUS_BUY_PUT"
+                else:
+                    final_action = 0
+                    final_confidence = 0.3
+                    gating_source = "NO_CONSENSUS"
+            
+            # ===== HARD VETOES (Per Phase 1) =====
+            # Liquidity and volatility agents can VETO any signal
+            
+            # Veto 1: Delta hedging says we need to hedge - override to HOLD
+            if delta_signal.action == 0 and delta_signal.confidence > 0.8:
+                if final_action != 0:
+                    final_action = 0
+                    final_confidence = 0.2
+                    gating_source = f"DELTA_VETO (was {gating_source})"
+            
+            # Veto 2: Gamma agent says high gamma risk - reduce confidence
+            if gamma_signal.confidence < 0.3:  # Low confidence = high uncertainty
+                final_confidence *= 0.7
+                gating_source += "_GAMMA_PENALIZED"
+            
+            # Log gating decision
+            # (Note: logging happens in mike_agent_live_safe.py)
+        
+        else:
+            # ===== LEGACY: Weighted voting (averaging) =====
+            # Apply hierarchical overrides
+            signals = self._apply_hierarchical_overrides(signals, weights)
+            
+            # Weighted voting with normalized confidence
+            action_scores = {0: 0.0, 1: 0.0, 2: 0.0}  # HOLD, BUY_CALL, BUY_PUT
+            
+            for signal in signals:
+                weight = weights.get(signal.agent_type, 0.10)
+                # Normalized confidence (already clamped to [0, 1])
+                confidence_weight = signal.confidence
+                combined_weight = weight * confidence_weight
+                
+                action_scores[signal.action] += combined_weight
+            
+            # Find winning action
+            final_action = max(action_scores, key=action_scores.get)
+            final_confidence = action_scores[final_action]
+            
+            # Normalize confidence using softmax for better scaling
+            total_score = sum(action_scores.values())
+            if total_score > 0:
+                # Softmax normalization for smoother confidence
+                import math
+                exp_scores = {k: math.exp(v * 2) for k, v in action_scores.items()}  # Scale by 2 for sharper
+                sum_exp = sum(exp_scores.values())
+                final_confidence = exp_scores[final_action] / sum_exp if sum_exp > 0 else 0.0
+            else:
+                final_confidence = 0.0
+            
+            # Apply confidence override rules
+            if final_confidence < max(0.1, self.min_confidence_threshold * 0.5):
+                final_action = 0
+                final_confidence = 0.3
+            
+            gating_source = "LEGACY_WEIGHTED"
         
         # Record signal for drift detection
         self.record_signal(final_action, final_confidence, regime)
         
         # Build details
+        # For gating mode, construct action_scores from final decision
+        if USE_GATING_ENSEMBLE and 'action_scores' not in dir():
+            action_scores = {0: 0.0, 1: 0.0, 2: 0.0}
+            action_scores[final_action] = final_confidence
+        
         details = {
             'regime': regime,
+            'gating_source': gating_source,  # Phase 1: Track why this decision was made
+            'ensemble_mode': 'GATING' if USE_GATING_ENSEMBLE else 'AVERAGING',
             'signals': {
                 'trend': {
                     'action': trend_signal.action,
                     'confidence': trend_signal.confidence,
                     'strength': trend_signal.strength,
                     'reasoning': trend_signal.reasoning,
-                    'weight': weights.get(AgentType.TREND, 0.20)
+                    'weight': weights.get(AgentType.TREND, 0.20),
+                    'selected': 'TREND' in gating_source if USE_GATING_ENSEMBLE else True
                 },
                 'reversal': {
                     'action': reversal_signal.action,
                     'confidence': reversal_signal.confidence,
                     'strength': reversal_signal.strength,
                     'reasoning': reversal_signal.reasoning,
-                    'weight': weights.get(AgentType.REVERSAL, 0.15)
+                    'weight': weights.get(AgentType.REVERSAL, 0.15),
+                    'selected': 'REVERSAL' in gating_source if USE_GATING_ENSEMBLE else True
                 },
                 'volatility': {
                     'action': volatility_signal.action,
                     'confidence': volatility_signal.confidence,
                     'strength': volatility_signal.strength,
                     'reasoning': volatility_signal.reasoning,
-                    'weight': weights.get(AgentType.VOLATILITY, 0.20)
+                    'weight': weights.get(AgentType.VOLATILITY, 0.20),
+                    'selected': 'VOL' in gating_source if USE_GATING_ENSEMBLE else True
                 },
                 'gamma_model': {
                     'action': gamma_signal.action,
                     'confidence': gamma_signal.confidence,
                     'strength': gamma_signal.strength,
                     'reasoning': gamma_signal.reasoning,
-                    'weight': weights.get(AgentType.GAMMA_MODEL, 0.20)
+                    'weight': weights.get(AgentType.GAMMA_MODEL, 0.20),
+                    'selected': 'GAMMA' in gating_source if USE_GATING_ENSEMBLE else True
                 },
                 'delta_hedging': {
                     'action': delta_signal.action,
                     'confidence': delta_signal.confidence,
                     'strength': delta_signal.strength,
                     'reasoning': delta_signal.reasoning,
-                    'weight': weights.get(AgentType.DELTA_HEDGING, 0.15)
+                    'weight': weights.get(AgentType.DELTA_HEDGING, 0.15),
+                    'selected': 'DELTA' in gating_source if USE_GATING_ENSEMBLE else True
                 },
                 'macro': {
                     'action': macro_signal.action,
                     'confidence': macro_signal.confidence,
                     'strength': macro_signal.strength,
                     'reasoning': macro_signal.reasoning,
-                    'weight': weights.get(AgentType.MACRO, 0.10)
+                    'weight': weights.get(AgentType.MACRO, 0.10),
+                    'selected': 'MACRO' in gating_source if USE_GATING_ENSEMBLE else True
                 }
             },
             'action_scores': action_scores,
